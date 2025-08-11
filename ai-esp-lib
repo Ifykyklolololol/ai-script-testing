@@ -1,24 +1,29 @@
--- box_bw_outline_esp.lua
--- Black & White (grayscale) animated Box ESP with optional outline.
--- Gradient "travels" around each box; main line is grayscale only.
+-- box_bw_outline_esp_v2.lua
+-- Black & White (grayscale) animated Box ESP with improved corner joining and outline.
+-- Fixes "pixel off" gaps via pixel alignment + slight segment overlap + continuous outline rectangle.
 -- Requires an executor that supports the Drawing API.
 
 --== CONFIG ==--
 getgenv().BWBoxESP = {
     Enabled = true,
-    TeamCheck = false,            -- don't draw on teammates
-    MaxDistance = 5000,           -- studs
-    Thickness = 2,                -- main line thickness
-    SegmentsPerEdge = 24,         -- higher = smoother gradient (total segments = 4x)
-    Speed = 0.18,                 -- how fast the grayscale travels around the box
-    Transparency = 1,             -- 0..1 for main line
+    TeamCheck = false,              -- don't draw on teammates
+    MaxDistance = 5000,             -- studs
+    Thickness = 2,                  -- main line thickness
+    SegmentsPerEdge = 24,           -- higher = smoother gradient
+    Speed = 0.18,                   -- grayscale travel speed
+    Transparency = 1,               -- 0..1 for main line
 
-    -- Outline settings
-    Outline = true,               -- draw an outline behind the main line
-    OutlineThickness = 2,         -- added on top of main Thickness
-    OutlineTransparency = 1,      -- 0..1
-    OutlineColor = Color3.new(0, 0, 0), -- default black outline
-    OnlyAlive = true,             -- only draw when humanoid health > 0
+    -- Outline
+    Outline = true,                 -- draw an outline behind the main line
+    OutlineThickness = 2,           -- added on top of main Thickness
+    OutlineTransparency = 1,        -- 0..1
+    OutlineColor = Color3.new(0,0,0),
+
+    OnlyAlive = true,               -- only draw when humanoid health > 0
+
+    -- Anti-gap helpers
+    PixelAlign = true,              -- quantize coordinates for crisp joins
+    SegmentOverlapPx = 0.75,        -- small overlap per segment to avoid tiny gaps
 }
 
 --== IMPLEMENTATION ==--
@@ -37,7 +42,7 @@ if not Drawing or not Drawing.new then
     return
 end
 
--- Utils
+-- Utilities
 local function isAlive(hum)
     if not hum then return false end
     return hum.Health > 0
@@ -51,28 +56,36 @@ local function isSameTeam(a, b)
     return ok and same or false
 end
 
-local function newLine(thickness, transparency)
+-- Align a coordinate to pixel centers to reduce gaps.
+-- For odd thickness, align to x.5; for even thickness, align to integer.
+local function alignCoord(v, thickness)
+    if not cfg.PixelAlign then return v end
+    local isOdd = (math.floor(thickness + 0.5) % 2) == 1
+    if isOdd then
+        return math.floor(v) + 0.5
+    else
+        return math.floor(v + 0.5)
+    end
+end
+
+local function newLine(thickness, transparency, z)
     local line = Drawing.new("Line")
     line.Visible = false
     line.Thickness = thickness
     line.Transparency = transparency
-    -- many Drawing APIs support ZIndex; set in case it's available
-    pcall(function()
-        line.ZIndex = 2
-    end)
+    pcall(function() line.ZIndex = z or 2 end)
     return line
 end
 
-local function newOutlineLine(outThickness, outTransparency, outColor)
-    local line = Drawing.new("Line")
-    line.Visible = false
-    line.Thickness = outThickness
-    line.Transparency = outTransparency
-    line.Color = outColor
-    pcall(function()
-        line.ZIndex = 1
-    end)
-    return line
+local function tryNewSquare()
+    local ok, obj = pcall(function() return Drawing.new("Square") end)
+    if ok and obj then
+        obj.Visible = false
+        obj.Filled = false
+        pcall(function() obj.ZIndex = 1 end)
+        return obj
+    end
+    return nil
 end
 
 -- Compute a 2D screen-space bounding rectangle for a character model
@@ -120,33 +133,41 @@ local function getScreenRect(model)
     return minX, minY, width, height
 end
 
--- Subdivide edges into segments for smooth animated gradient
-local function subdivideEdge(x1, y1, x2, y2, n)
-    local segments = table.create(n)
-    for i = 0, n - 1 do
-        local t0 = i / n
-        local t1 = (i + 1) / n
-        local sx = x1 + (x2 - x1) * t0
-        local sy = y1 + (y2 - y1) * t0
-        local ex = x1 + (x2 - x1) * t1
-        local ey = y1 + (y2 - y1) * t1
-        segments[i + 1] = {sx, sy, ex, ey}
-    end
-    return segments
-end
-
-local function rectSegments(x, y, w, h, perEdge)
+-- Build segment endpoints for rectangle perimeter with slight overlap
+local function rectSegments(x, y, w, h, perEdge, overlapPx, baseThickness)
     local segs = {}
 
-    local top = subdivideEdge(x, y, x + w, y, perEdge)
-    local right = subdivideEdge(x + w, y, x + w, y + h, perEdge)
-    local bottom = subdivideEdge(x + w, y + h, x, y + h, perEdge)
-    local left = subdivideEdge(x, y + h, x, y, perEdge)
+    local function addEdge(x1, y1, x2, y2)
+        local dx, dy = x2 - x1, y2 - y1
+        local len = math.sqrt(dx*dx + dy*dy)
+        local overFrac = 0
+        if overlapPx and overlapPx > 0 and len > 0 then
+            overFrac = overlapPx / len
+        end
+        for i = 0, perEdge - 1 do
+            local t0 = i / perEdge - overFrac
+            local t1 = (i + 1) / perEdge + overFrac
+            -- Don't clamp to let edges slightly overreach corners (helps hide gaps)
+            local sx = x1 + dx * t0
+            local sy = y1 + dy * t0
+            local ex = x1 + dx * t1
+            local ey = y1 + dy * t1
 
-    for _, s in ipairs(top) do table.insert(segs, s) end
-    for _, s in ipairs(right) do table.insert(segs, s) end
-    for _, s in ipairs(bottom) do table.insert(segs, s) end
-    for _, s in ipairs(left) do table.insert(segs, s) end
+            -- Pixel align at assignment
+            sx = alignCoord(sx, baseThickness)
+            sy = alignCoord(sy, baseThickness)
+            ex = alignCoord(ex, baseThickness)
+            ey = alignCoord(ey, baseThickness)
+
+            segs[#segs + 1] = {sx, sy, ex, ey}
+        end
+    end
+
+    -- top, right, bottom, left (clockwise)
+    addEdge(x, y, x + w, y)         -- top
+    addEdge(x + w, y, x + w, y + h) -- right
+    addEdge(x + w, y + h, x, y + h) -- bottom
+    addEdge(x, y + h, x, y)         -- left
 
     return segs
 end
@@ -154,7 +175,8 @@ end
 -- State
 local ESP = {}
 -- ESP[player] = {
---   pairs = { [1..N] = {outline = DrawingLine?, main = DrawingLine} },
+--   pairs = { [1..N] = {main = DrawingLine} },
+--   outlineRect = DrawingSquare?,
 --   totalSegments = number
 -- }
 
@@ -164,8 +186,10 @@ local function clearPlayerEsp(plr)
     if entry.pairs then
         for _, p in ipairs(entry.pairs) do
             if p.main then pcall(function() p.main.Visible = false p.main:Remove() end) end
-            if p.outline then pcall(function() p.outline.Visible = false p.outline:Remove() end) end
         end
+    end
+    if entry.outlineRect then
+        pcall(function() entry.outlineRect.Visible = false entry.outlineRect:Remove() end)
     end
     ESP[plr] = nil
 end
@@ -179,15 +203,16 @@ local function ensurePlayerEsp(plr, neededSegments)
 
     local pairsArr = table.create(neededSegments)
     for i = 1, neededSegments do
-        local outlineObj = nil
-        if cfg.Outline then
-            outlineObj = newOutlineLine(cfg.Thickness + cfg.OutlineThickness, cfg.OutlineTransparency, cfg.OutlineColor)
-        end
-        local mainObj = newLine(cfg.Thickness, cfg.Transparency)
-        pairsArr[i] = { outline = outlineObj, main = mainObj }
+        local mainObj = newLine(cfg.Thickness, cfg.Transparency, 2)
+        pairsArr[i] = { main = mainObj }
     end
 
-    entry = { pairs = pairsArr, totalSegments = neededSegments }
+    local outlineRect = nil
+    if cfg.Outline then
+        outlineRect = tryNewSquare()
+    end
+
+    entry = { pairs = pairsArr, outlineRect = outlineRect, totalSegments = neededSegments }
     ESP[plr] = entry
     return entry
 end
@@ -199,8 +224,8 @@ RunService.RenderStepped:Connect(function(dt)
         for _, entry in pairs(ESP) do
             for _, p in ipairs(entry.pairs) do
                 if p.main then p.main.Visible = false end
-                if p.outline then p.outline.Visible = false end
             end
+            if entry.outlineRect then entry.outlineRect.Visible = false end
         end
         return
     end
@@ -208,8 +233,7 @@ RunService.RenderStepped:Connect(function(dt)
     local myChar = LocalPlayer.Character
     local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
     local perEdge = math.max(2, cfg.SegmentsPerEdge)
-
-    -- animated phase for grayscale wave
+    local totalSegs = 4 * perEdge
     local phaseOffset = (tick() * cfg.Speed) % 1
 
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -229,53 +253,61 @@ RunService.RenderStepped:Connect(function(dt)
                 shouldDraw = false
             end
 
-            local x, y, w, h = nil, nil, nil, nil
-            if shouldDraw then
-                x, y, w, h = getScreenRect(char)
-                if not x then
-                    shouldDraw = false
-                end
-            end
-
-            local totalSegs = 4 * perEdge
             local entry = ensurePlayerEsp(plr, totalSegs)
-            local pairsArr = entry.pairs
 
             if shouldDraw then
-                local segs = rectSegments(x, y, w, h, perEdge)
-
-                for i = 1, totalSegs do
-                    local s = segs[i]
-                    local pair = pairsArr[i]
-
-                    -- grayscale value 0..1 that travels around the perimeter
-                    local t = (i - 1) / totalSegs
-                    local wave = math.sin(2 * math.pi * ((t + phaseOffset) % 1))
-                    local v = 0.5 + 0.5 * wave -- 0..1
-                    local gray = Color3.fromHSV(0, 0, v)
-
-                    if pair.outline then
-                        pair.outline.Thickness = cfg.Thickness + cfg.OutlineThickness
-                        pair.outline.Transparency = cfg.OutlineTransparency
-                        pair.outline.Color = cfg.OutlineColor
-                        pair.outline.From = Vector2.new(s[1], s[2])
-                        pair.outline.To   = Vector2.new(s[3], s[4])
-                        pair.outline.Visible = true
+                local x, y, w, h = getScreenRect(char)
+                if x then
+                    -- Outline rectangle (continuous) sits behind the segmented main lines
+                    if entry.outlineRect and cfg.Outline then
+                        local th = cfg.Thickness + cfg.OutlineThickness
+                        local ax = alignCoord(x, th)
+                        local ay = alignCoord(y, th)
+                        local aw = math.max(0, w) -- Size shouldn't be aligned to avoid zero width
+                        local ah = math.max(0, h)
+                        entry.outlineRect.Position = Vector2.new(ax, ay)
+                        entry.outlineRect.Size = Vector2.new(aw, ah)
+                        entry.outlineRect.Thickness = th
+                        entry.outlineRect.Transparency = cfg.OutlineTransparency
+                        entry.outlineRect.Color = cfg.OutlineColor
+                        entry.outlineRect.Visible = true
                     end
 
-                    pair.main.Color = gray
-                    pair.main.Thickness = cfg.Thickness
-                    pair.main.Transparency = cfg.Transparency
-                    pair.main.From = Vector2.new(s[1], s[2])
-                    pair.main.To   = Vector2.new(s[3], s[4])
-                    pair.main.Visible = true
+                    -- Build segments with overlap + pixel alignment
+                    local segs = rectSegments(x, y, w, h, perEdge, cfg.SegmentOverlapPx, cfg.Thickness)
+
+                    for i = 1, totalSegs do
+                        local s = segs[i]
+                        local ln = entry.pairs[i]
+
+                        -- grayscale value 0..1 that travels around the perimeter
+                        local t = (i - 1) / totalSegs
+                        local wave = math.sin(2 * math.pi * ((t + phaseOffset) % 1))
+                        local v = 0.5 + 0.5 * wave -- 0..1
+                        local gray = Color3.fromHSV(0, 0, v)
+
+                        ln.main.Color = gray
+                        ln.main.Thickness = cfg.Thickness
+                        ln.main.Transparency = cfg.Transparency
+                        ln.main.From = Vector2.new(s[1], s[2])
+                        ln.main.To   = Vector2.new(s[3], s[4])
+                        ln.main.Visible = true
+                    end
+                else
+                    -- off-screen
+                    for i = 1, totalSegs do
+                        local ln = entry.pairs[i]
+                        if ln and ln.main then ln.main.Visible = false end
+                    end
+                    if entry.outlineRect then entry.outlineRect.Visible = false end
                 end
             else
+                -- not drawable
                 for i = 1, totalSegs do
-                    local pair = pairsArr[i]
-                    if pair.main then pair.main.Visible = false end
-                    if pair.outline then pair.outline.Visible = false end
+                    local ln = entry.pairs[i]
+                    if ln and ln.main then ln.main.Visible = false end
                 end
+                if entry.outlineRect then entry.outlineRect.Visible = false end
             end
         end
     end
@@ -300,10 +332,13 @@ getgenv().BWBoxESP_SetEnabled = function(v)
         for _, entry in pairs(ESP) do
             for _, p in ipairs(entry.pairs) do
                 if p.main then p.main.Visible = false end
-                if p.outline then p.outline.Visible = false end
             end
+            if entry.outlineRect then entry.outlineRect.Visible = false end
         end
     end
 end
 
-print("YTO")
+print("[BWBoxESP v2] Loaded. Fixes corner gaps with pixel-align + overlap + outline rect.")
+print("Tweaks:")
+print("getgenv().BWBoxESP.PixelAlign = true")
+print("getgenv().BWBoxESP.SegmentOverlapPx = 0.75  -- set 0 to disable")
