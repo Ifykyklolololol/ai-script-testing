@@ -1,82 +1,71 @@
 --!nocheck
--- BillboardESP_v2.lua
--- Aesthetic ESP using BillboardGui + 2D overlay (corner box, tracers, skeleton, arrows)
--- Focused on clean, modern visuals: neon gradient plate, rounded "bracket" corners,
--- softer glow, distance-aware thickness, and tasteful transparency.
--- Drop as ModuleScript "BillboardESP_v2" and require() from a LocalScript.
+-- ESP_Drawing_Outlines.lua
+-- Drawing API ESP focused on *crisp outlines* (no neon/glow).
+-- Clean bracket boxes, tracer + dot (with ring outline), skeleton, arrows, name/distance, and HP bar.
+-- Requires an executor that supports the Drawing API.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-
+local UIS = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
---====================
--- Public config
---====================
 local defaultConfig = {
 	Enabled = true,
 	MaxDistance = 3000,
 	VisibleOnly = false,
 	DisableOnTeammates = false,
 	UseTeamColors = false,
-	FadeWithDistance = true,
 
-	-- Visual style
-	Style = "Nebula", -- "Nebula" (purple->blue) | "Mono"
-	AccentColor = Color3.fromRGB(180, 90, 255), -- used in Mono
-	Glow = true,
-	GlowTransparency = 0.4,
-	BaseThickness = 2, -- base thickness for lines
+	-- Visual tuning
+	BaseThickness = 2,       -- base line thickness
+	FadeWithDistance = true, -- reduce alpha with distance
 
-	-- Plate
-	PlateEnabled = true,
-	PlateYOffset = 2.6,
-	PlateScale = 1.0,
-	ShowName = true,
-	ShowDistance = true,
-	ShowHealthbar = true,
+	-- Colors (minimal, high-contrast defaults)
+	Accent = Color3.fromRGB(180, 180, 255),
+	OutlineColor = Color3.fromRGB(15, 15, 20),
+	OutlineWidth = 2,        -- how much thicker the outline is than the main line
+	OutlineAlpha = 1.0,      -- 0..1 transparency for outline
+
+	NameColor = Color3.fromRGB(245,245,245),
+	InfoColor = Color3.fromRGB(190, 200, 230),
 
 	-- Box
-	BoxEnabled = true,
-	CornerLenRatio = 0.18, -- percent of box size per corner segment
-	CornerThickness = 2,
+	Box = true,
+	CornerLenRatio = 0.18,
 
 	-- Skeleton
 	Skeleton = true,
-	SkeletonMaxDist = 1200,
+	SkeletonMaxDist = 1500,
 
-	-- Tracers
-	Tracers = true,
-	TracerFrom = "bottom", -- "top" | "center" | "bottom"
+	-- Tracer
+	Tracer = true,
+	TracerFrom = "bottom", -- top | center | bottom
 	TracerDot = true,
 
-	-- Arrows (out of FOV)
+	-- Plate (text + HP bar)
+	Plate = true,
+	ShowName = true,
+	ShowDistance = true,
+	HPBar = true,
+	PlateYOffset = 2.6,
+	TextSize = 14,
+
+	-- Offscreen arrows
 	Arrows = true,
-	ArrowSize = 16,
+	ArrowSize = 14,
 	ArrowRadius = 120,
+
+	-- Optional FOV circle
+	ShowFOV = false,
+	FOVRadius = 140,
 }
 
---====================
--- Internal
---====================
-local function getGuiRoot()
-	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	if pg then return pg end
-	if gethui then
-		local ui = gethui()
-		if ui then return ui end
-	end
-	return game:GetService("CoreGui")
+-- Utilities
+local function hasDrawing()
+	return (typeof(Drawing) == "table" or typeof(Drawing) == "userdata") and typeof(Drawing.new) == "function"
 end
-
-local Overlay = Instance.new("ScreenGui")
-Overlay.Name = "BillboardESP_Overlay_v2"
-Overlay.ResetOnSpawn = false
-Overlay.IgnoreGuiInset = true
-Overlay.ZIndexBehavior = Enum.ZIndexBehavior.Global
-Overlay.Parent = getGuiRoot()
 
 local function toScreen(pos: Vector3)
 	local v, on = Camera:WorldToViewportPoint(pos)
@@ -88,254 +77,102 @@ local function isVisible(origin: Vector3, target: Vector3, ignoreList: {Instance
 	params.FilterDescendantsInstances = ignoreList
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = true
-	local result = Workspace:Raycast(origin, (target - origin), params)
-	return (result == nil)
+	local r = Workspace:Raycast(origin, (target - origin), params)
+	return r == nil
 end
 
-local function lerp(a, b, t) return a + (b-a)*t end
-
+local function lerp(a,b,t) return a + (b-a)*t end
 local function colorLerp(a: Color3, b: Color3, t: number)
-	return Color3.new(lerp(a.R, b.R, t), lerp(a.G, b.G, t), lerp(a.B, b.B, t))
+	return Color3.new(lerp(a.R,b.R,t), lerp(a.G,b.G,t), lerp(a.B,b.B,t))
+end
+local function alphaByDistance(cfg, d)
+	if not cfg.FadeWithDistance then return 1 end
+	return 1 - math.clamp(d / cfg.MaxDistance, 0, 1) * 0.6
+end
+local function thickByDistance(cfg, d)
+	local t = 1 - math.clamp(d / cfg.MaxDistance, 0, 1)
+	return math.clamp(cfg.BaseThickness + t * 1.8, cfg.BaseThickness, cfg.BaseThickness + 2)
+end
+local function teamColor(p: Player, fallback: Color3): Color3
+	if p.Team and p.Team.TeamColor then return p.Team.TeamColor.Color end
+	return fallback
 end
 
-local function nebulaGradient() -- purple->pink->blue
-	return ColorSequence.new({
-		ColorSequenceKeypoint.new(0, Color3.fromRGB(194, 90, 255)),
-		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 78, 180)),
-		ColorSequenceKeypoint.new(1, Color3.fromRGB(95, 160, 255)),
-	})
+-- Drawing factories
+local function newLine()
+	local l = Drawing.new("Line")
+	l.Visible = false
+	l.Thickness = 1
+	l.Color = Color3.new(1,1,1)
+	l.Transparency = 1
+	return l
+end
+local function drawLine(line, a: Vector2, b: Vector2, th: number, col: Color3, alpha: number)
+	line.From = a
+	line.To = b
+	line.Thickness = th
+	line.Color = col
+	line.Transparency = alpha
+	line.Visible = true
 end
 
-local function getAccent(cfg, player: Player)
-	if cfg.UseTeamColors and player.Team and player.Team.TeamColor then
-		return player.Team.TeamColor.Color
-	end
-	return cfg.AccentColor
+local function newText()
+	local t = Drawing.new("Text")
+	t.Visible = false
+	t.Size = 14
+	t.Center = true
+	t.Outline = true
+	t.OutlineColor = Color3.fromRGB(0,0,0)
+	t.Color = Color3.new(1,1,1)
+	t.Text = ""
+	t.Position = Vector2.new(0,0)
+	return t
 end
 
--- line factory (2D frame with stroke & soft glow)
-local function newLine(parent: Instance, z: number): Frame
-	local f = Instance.new("Frame")
-	f.BackgroundColor3 = Color3.new(1,1,1)
-	f.BorderSizePixel = 0
-	f.AnchorPoint = Vector2.new(0.5, 0.5)
-	f.Size = UDim2.fromOffset(0,0)
-	f.Visible = false
-	f.ZIndex = z or 25
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = 4
-	stroke.Transparency = 0.5
-	stroke.LineJoinMode = Enum.LineJoinMode.Round
-	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	stroke.Parent = f
-
-	local round = Instance.new("UICorner")
-	round.CornerRadius = UDim.new(0, 999)
-	round.Parent = f
-
-	-- gradient on fill (nice for bigger boxes)
-	local grad = Instance.new("UIGradient")
-	grad.Rotation = 0
-	grad.Enabled = false -- only used for plates/large elements
-	grad.Parent = f
-
-	f.Parent = parent
-	return f
+local function newSquare()
+	local s = Drawing.new("Square")
+	s.Visible = false
+	s.Thickness = 1
+	s.Filled = true
+	s.Color = Color3.new(1,1,1)
+	s.Transparency = 1
+	return s
 end
 
-local function setLine(f: Frame, a: Vector2, b: Vector2, thickness: number, color: Color3, glow: boolean)
-	local dir = b - a
-	local len = dir.Magnitude
-	if len < 1 then f.Visible = false return end
-	f.Visible = true
-	f.Size = UDim2.fromOffset(len, thickness)
-	f.Position = UDim2.fromOffset(a.X + dir.X/2, a.Y + dir.Y/2)
-	f.Rotation = math.deg(math.atan2(dir.Y, dir.X))
-	f.BackgroundColor3 = color
-
-	local s = f:FindFirstChildOfClass("UIStroke")
-	if s then
-		s.Enabled = glow
-		s.Color = color
-		s.Thickness = math.max(4, thickness + 2)
-		s.Transparency = 0.6
-	end
+local function newRectOutline()
+	local s = Drawing.new("Square")
+	s.Visible = false
+	s.Thickness = 1
+	s.Filled = false
+	s.Color = Color3.fromRGB(0,0,0)
+	s.Transparency = 1
+	return s
 end
 
-local function newDot(parent: Instance, size: number, z: number): Frame
-	local d = Instance.new("Frame")
-	d.Size = UDim2.fromOffset(size, size)
-	d.AnchorPoint = Vector2.new(0.5, 0.5)
-	d.BackgroundColor3 = Color3.new(1,1,1)
-	d.Visible = false
-	d.ZIndex = z or 26
-	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 999); c.Parent = d
-	local s = Instance.new("UIStroke"); s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.LineJoinMode = Enum.LineJoinMode.Round; s.Thickness = 6; s.Transparency = 0.6; s.Parent = d
-	d.Parent = parent
-	return d
+local function newCircle()
+	local c = Drawing.new("Circle")
+	c.Visible = false
+	c.Filled = true
+	c.NumSides = 24
+	c.Radius = 2
+	c.Color = Color3.new(1,1,1)
+	c.Transparency = 1
+	return c
+end
+local function newRing()
+	local c = Drawing.new("Circle")
+	c.Visible = false
+	c.Filled = false
+	c.NumSides = 28
+	c.Radius = 3
+	c.Thickness = 2
+	c.Color = Color3.fromRGB(0,0,0)
+	c.Transparency = 1
+	return c
 end
 
-local function setDot(dot: Frame, pos: Vector2, size: number, color: Color3, glow: boolean, alpha: number)
-	dot.Position = UDim2.fromOffset(pos.X, pos.Y)
-	dot.Size = UDim2.fromOffset(size, size)
-	dot.BackgroundColor3 = color
-	local s = dot:FindFirstChildOfClass("UIStroke")
-	if s then s.Color = color; s.Enabled = glow end
-	dot.BackgroundTransparency = 1 - alpha
-	dot.Visible = true
-end
-
--- box corner segments
-local function ensureCorners(parent: Instance): {Frame}
-	local list = {}
-	for i=1,8 do table.insert(list, newLine(parent, 22)) end
-	return list
-end
-
--- Out-of-FOV arrow (three mini lines shaped like a chevron)
-local function ensureArrow(parent: Instance): Frame
-	local container = Instance.new("Frame")
-	container.Name = "Arrow"
-	container.Size = UDim2.fromOffset(20,20)
-	container.AnchorPoint = Vector2.new(0.5,0.5)
-	container.BackgroundTransparency = 1
-	container.Visible = false
-	container.ZIndex = 30
-	container.Parent = parent
-
-	for i=1,3 do
-		local seg = newLine(container, 31)
-		seg.Visible = true
-	end
-	return container
-end
-
-local function placeChevron(container: Frame, center: Vector2, size: number, rotDeg: number, color: Color3, glow: boolean)
-	container.Position = UDim2.fromOffset(center.X, center.Y)
-	container.Rotation = rotDeg
-	container.Visible = true
-
-	local children = container:GetChildren()
-	local a = children[1] :: Frame
-	local b = children[2] :: Frame
-	local c = children[3] :: Frame
-	if a and b and c then
-		setLine(a, Vector2.new(-size*0.4, 0), Vector2.new(0, size*0.6), 2, color, glow)
-		setLine(b, Vector2.new(0, size*0.6), Vector2.new(size*0.4, 0), 2, color, glow)
-		setLine(c, Vector2.new(-size*0.25, 0), Vector2.new(size*0.25, 0), 2, color, glow)
-	end
-end
-
--- Build billboard plate (capsule with gradient + glow)
-local function createPlate(adornPart: BasePart, cfg)
-	local bb = Instance.new("BillboardGui")
-	bb.Adornee = adornPart
-	bb.AlwaysOnTop = true
-	bb.Size = UDim2.fromOffset(220 * cfg.PlateScale, 66 * cfg.PlateScale)
-	bb.StudsOffset = Vector3.new(0, cfg.PlateYOffset, 0)
-	bb.Name = "ESPPlate_v2"
-
-	local base = Instance.new("Frame")
-	base.Size = UDim2.fromScale(1,1)
-	base.BackgroundColor3 = Color3.fromRGB(18, 16, 28)
-	base.BackgroundTransparency = 0.15
-	base.BorderSizePixel = 0
-	base.Parent = bb
-
-	local pill = Instance.new("UICorner")
-	pill.CornerRadius = UDim.new(0, 16)
-	pill.Parent = base
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = 2
-	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	stroke.Transparency = 0.15
-	stroke.Color = Color3.fromRGB(200, 120, 255)
-	stroke.Parent = base
-
-	local glow = Instance.new("UIStroke")
-	glow.Name = "Glow"
-	glow.Thickness = 8
-	glow.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	glow.Transparency = cfg.GlowTransparency
-	glow.Color = Color3.fromRGB(200, 120, 255)
-	glow.Parent = base
-
-	local grad = Instance.new("UIGradient")
-	grad.Rotation = 0
-	grad.Color = nebulaGradient()
-	grad.Enabled = (cfg.Style == "Nebula")
-	grad.Parent = base
-
-	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
-	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-	layout.VerticalAlignment = Enum.VerticalAlignment.Center
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Parent = base
-
-	local nameLbl, distLbl
-	if cfg.ShowName then
-		nameLbl = Instance.new("TextLabel")
-		nameLbl.Size = UDim2.fromScale(1, 0.6)
-		nameLbl.BackgroundTransparency = 1
-		nameLbl.TextScaled = true
-		nameLbl.Font = Enum.Font.GothamBold
-		nameLbl.TextColor3 = Color3.new(1,1,1)
-		nameLbl.Text = ""
-		nameLbl.LayoutOrder = 1
-		nameLbl.Parent = base
-	end
-
-	if cfg.ShowDistance then
-		distLbl = Instance.new("TextLabel")
-		distLbl.Size = UDim2.fromScale(1, 0.35)
-		distLbl.BackgroundTransparency = 1
-		distLbl.TextScaled = true
-		distLbl.Font = Enum.Font.GothamSemibold
-		distLbl.TextColor3 = Color3.fromRGB(180, 190, 255)
-		distLbl.Text = ""
-		distLbl.LayoutOrder = 2
-		distLbl.Parent = base
-	end
-
-	local hbBack, hbFill
-	if cfg.ShowHealthbar then
-		hbBack = Instance.new("Frame")
-		hbBack.Size = UDim2.fromScale(0.9, 0.12)
-		hbBack.BackgroundColor3 = Color3.fromRGB(35, 40, 65)
-		hbBack.BorderSizePixel = 0
-		hbBack.LayoutOrder = 3
-		hbBack.Parent = base
-
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 10)
-		corner.Parent = hbBack
-
-		hbFill = Instance.new("Frame")
-		hbFill.AnchorPoint = Vector2.new(0, 0.5)
-		hbFill.Position = UDim2.fromScale(0, 0.5)
-		hbFill.Size = UDim2.fromScale(1, 1)
-		hbFill.BackgroundColor3 = Color3.fromRGB(110, 255, 180)
-		hbFill.BorderSizePixel = 0
-		hbFill.Parent = hbBack
-
-		local corner2 = Instance.new("UICorner")
-		corner2.CornerRadius = UDim.new(0, 10)
-		corner2.Parent = hbFill
-
-		local g = Instance.new("UIGradient")
-		g.Color = ColorSequence.new(Color3.fromRGB(255,90,90), Color3.fromRGB(110,255,180))
-		g.Rotation = 0
-		g.Parent = hbFill
-	end
-
-	return bb, base, nameLbl, distLbl, hbFill, hbBack
-end
-
--- skeleton maps
-local skeletonR15 = {
+-- Skeleton maps
+local SkelR15 = {
 	{"Head","UpperTorso"},
 	{"UpperTorso","LowerTorso"},
 	{"UpperTorso","LeftUpperArm"},
@@ -351,7 +188,7 @@ local skeletonR15 = {
 	{"RightUpperLeg","RightLowerLeg"},
 	{"RightLowerLeg","RightFoot"},
 }
-local skeletonR6 = {
+local SkelR6 = {
 	{"Head","Torso"},
 	{"Torso","Left Arm"},
 	{"Torso","Right Arm"},
@@ -359,6 +196,7 @@ local skeletonR6 = {
 	{"Torso","Right Leg"},
 }
 
+-- ESP class
 local ESP = {}
 ESP.__index = ESP
 
@@ -368,71 +206,95 @@ function ESP.new()
 	self._caches = {} -- keyed by Player
 	self._cons = {}
 	self._running = false
+	self._fov = nil
 	return self
 end
 
+local function destroyCache(cache)
+	for _,obj in ipairs(cache._objects) do
+		pcall(function() obj.Visible = false obj:Remove() end)
+	end
+end
+
 local function makeCache(self, player: Player, model: Model)
-	local hum: Humanoid? = model:FindFirstChildOfClass("Humanoid")
-	local root: BasePart? = model:FindFirstChild("HumanoidRootPart")
-
-	local bb, base, nameLbl, distLbl, hbFill, hbBack = nil, nil, nil, nil, nil, nil
-	if root then
-		bb, base, nameLbl, distLbl, hbFill, hbBack = createPlate(root, self.Config)
-		bb.Parent = model
-	end
-
-	local boxHolder = Instance.new("Frame")
-	boxHolder.BackgroundTransparency = 1
-	boxHolder.Size = UDim2.fromOffset(0,0)
-	boxHolder.Parent = Overlay
-
-	local corners = ensureCorners(boxHolder)
-	local tracer = newLine(Overlay, 24)
-	local tracerDot = newDot(Overlay, 6, 26)
-
-	local sk = {}
-	for i=1, 16 do
-		table.insert(sk, newLine(Overlay, 23))
-	end
-
-	local arrow = ensureArrow(Overlay)
+	local root = model:FindFirstChild("HumanoidRootPart")
+	local hum = model:FindFirstChildOfClass("Humanoid")
 
 	local cache = {
-		player = player,
-		model = model,
-		hum = hum,
-		root = root,
+		player = player, model = model, root = root, hum = hum,
 		rigType = hum and hum.RigType or nil,
-		billboard = bb,
-		base = base,
-		nameLbl = nameLbl,
-		distLbl = distLbl,
-		hbFill = hbFill,
-		hbBack = hbBack,
-		boxHolder = boxHolder,
-		corners = corners,
-		tracer = tracer,
-		tracerDot = tracerDot,
-		skeletonLines = sk,
-		arrow = arrow,
+		_objects = {},
+
+		-- bracket corners
+		box = {}, boxOutline = {},
+
+		-- tracer + outline + dot + ring
+		tracer = newLine(),
+		tracerOutline = newLine(),
+		dot = newCircle(),
+		dotRing = newRing(),
+
+		-- skeleton
+		skel = {}, skelOutline = {},
+
+		-- text
+		nameText = newText(),
+		distText = newText(),
+
+		-- hp
+		hpBack = newSquare(),
+		hpFill = newSquare(),
+		hpOutline = newRectOutline(),
+
+		-- offscreen arrow (3 lines)
+		arr = { newLine(), newLine(), newLine() },
+		arrOutline = { newLine(), newLine(), newLine() },
 	}
-	self._caches[player] = cache
+
+	table.insert(cache._objects, cache.tracer)
+	table.insert(cache._objects, cache.tracerOutline)
+	table.insert(cache._objects, cache.dot)
+	table.insert(cache._objects, cache.dotRing)
+	for i=1,8 do
+		cache.box[i] = newLine(); table.insert(cache._objects, cache.box[i])
+		cache.boxOutline[i] = newLine(); table.insert(cache._objects, cache.boxOutline[i])
+	end
+	for i=1,16 do
+		cache.skel[i] = newLine(); table.insert(cache._objects, cache.skel[i])
+		cache.skelOutline[i] = newLine(); table.insert(cache._objects, cache.skelOutline[i])
+	end
+	table.insert(cache._objects, cache.nameText)
+	table.insert(cache._objects, cache.distText)
+	table.insert(cache._objects, cache.hpBack)
+	table.insert(cache._objects, cache.hpFill)
+	table.insert(cache._objects, cache.hpOutline)
+	for i=1,3 do
+		table.insert(cache._objects, cache.arr[i])
+		table.insert(cache._objects, cache.arrOutline[i])
+	end
+
 	return cache
 end
 
-local function destroyCache(cache)
-	if cache.billboard then cache.billboard:Destroy() end
-	if cache.boxHolder then cache.boxHolder:Destroy() end
-	if cache.tracer then cache.tracer:Destroy() end
-	if cache.tracerDot then cache.tracerDot:Destroy() end
-	if cache.arrow then cache.arrow:Destroy() end
-	for _,l in ipairs(cache.skeletonLines) do l:Destroy() end
+local function hideCache(cache)
+	cache.tracer.Visible = false
+	cache.tracerOutline.Visible = false
+	cache.dot.Visible = false
+	cache.dotRing.Visible = false
+	for i=1,8 do cache.box[i].Visible = false cache.boxOutline[i].Visible=false end
+	for i=1,16 do cache.skel[i].Visible = false cache.skelOutline[i].Visible=false end
+	cache.nameText.Visible = false
+	cache.distText.Visible = false
+	cache.hpBack.Visible = false
+	cache.hpFill.Visible = false
+	cache.hpOutline.Visible = false
+	for i=1,3 do cache.arr[i].Visible = false cache.arrOutline[i].Visible=false end
 end
 
 local function getBox2D(model: Model)
 	local cf, size = model:GetBoundingBox()
 	local half = size/2
-	local corners = {
+	local pts = {
 		(cf * CFrame.new( half.X,  half.Y,  half.Z)).Position,
 		(cf * CFrame.new( half.X,  half.Y, -half.Z)).Position,
 		(cf * CFrame.new( half.X, -half.Y,  half.Z)).Position,
@@ -444,222 +306,258 @@ local function getBox2D(model: Model)
 	}
 	local minV = Vector2.new(math.huge, math.huge)
 	local maxV = Vector2.new(-math.huge, -math.huge)
-	local on = false
-	for _, w in ipairs(corners) do
-		local s, ok = toScreen(w)
-		if ok then on = true end
+	local any = false
+	for _,w in ipairs(pts) do
+		local s,on = toScreen(w)
+		if on then any = true end
 		minV = Vector2.new(math.min(minV.X, s.X), math.min(minV.Y, s.Y))
 		maxV = Vector2.new(math.max(maxV.X, s.X), math.max(maxV.Y, s.Y))
 	end
-	return minV, maxV, on
+	return minV, maxV, any
 end
 
-local function alphaByDistance(cfg, d)
-	if not cfg.FadeWithDistance then return 1 end
-	local t = math.clamp(d / cfg.MaxDistance, 0, 1)
-	return 1 - (t * 0.75)
+local function offscreenTriangle(pos: Vector2, angleRad: number, size: number)
+	local tip = pos + Vector2.new(math.cos(angleRad), math.sin(angleRad)) * size
+	local left = pos + Vector2.new(math.cos(angleRad + math.rad(140)), math.sin(angleRad + math.rad(140))) * size * 0.7
+	local right = pos + Vector2.new(math.cos(angleRad - math.rad(140)), math.sin(angleRad - math.rad(140))) * size * 0.7
+	return left, tip, right
 end
 
-local function thicknessByDistance(cfg, d)
-	local base = cfg.BaseThickness
-	-- closer = thicker, far = thinner
-	local t = 1 - math.clamp(d / cfg.MaxDistance, 0, 1)
-	return math.clamp(base + t * 2, base, base + 2)
-end
-
-local function updateOne(self, player: Player, cache, dt)
+local function updateOne(self, player: Player, cache)
 	local cfg = self.Config
-	local model = cache.model
-	local hum = cache.hum
-	local root = cache.root
-
+	local model, hum, root = cache.model, cache.hum, cache.root
 	if not model or not model.Parent or not hum or hum.Health <= 0 or not root then
-		if cache.billboard then cache.billboard.Enabled = false end
-		for _,f in ipairs(cache.corners) do f.Visible = false end
-		for _,l in ipairs(cache.skeletonLines) do l.Visible = false end
-		if cache.tracer then cache.tracer.Visible = false end
-		if cache.tracerDot then cache.tracerDot.Visible = false end
-		if cache.arrow then cache.arrow.Visible = false end
-		return
+		hideCache(cache); return
 	end
 
 	local camPos = Camera.CFrame.Position
 	local d = (root.Position - camPos).Magnitude
-	if d > cfg.MaxDistance then
-		if cache.billboard then cache.billboard.Enabled = false end
-		for _,f in ipairs(cache.corners) do f.Visible = false end
-		for _,l in ipairs(cache.skeletonLines) do l.Visible = false end
-		if cache.tracer then cache.tracer.Visible = false end
-		if cache.tracerDot then cache.tracerDot.Visible = false end
-		if cache.arrow then cache.arrow.Visible = false end
-		return
-	end
-
+	if d > cfg.MaxDistance then hideCache(cache) return end
 	if cfg.DisableOnTeammates and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
-		if cache.billboard then cache.billboard.Enabled = false end
-		for _,f in ipairs(cache.corners) do f.Visible = false end
-		for _,l in ipairs(cache.skeletonLines) do l.Visible = false end
-		if cache.tracer then cache.tracer.Visible = false end
-		if cache.tracerDot then cache.tracerDot.Visible = false end
-		if cache.arrow then cache.arrow.Visible = false end
-	return end
-
-	local onVis = true
-	if cfg.VisibleOnly then
-		onVis = isVisible(camPos, root.Position, {LocalPlayer.Character})
+		hideCache(cache) return
 	end
+
+	local vis = true
+	if cfg.VisibleOnly then vis = isVisible(camPos, root.Position, {LocalPlayer.Character}) end
 
 	local alpha = alphaByDistance(cfg, d)
-	local color = getAccent(cfg, player)
-	local faint = colorLerp(color, Color3.new(1,1,1), 0.35)
-	local lineThickness = thicknessByDistance(cfg, d)
+	local thick = thickByDistance(cfg, d)
+	local accent = cfg.UseTeamColors and teamColor(player, cfg.Accent) or cfg.Accent
+	local outlineCol, outlineA = cfg.OutlineColor, math.clamp(cfg.OutlineAlpha * alpha, 0, 1)
 
-	--================ Plate =================
-	if cache.billboard and cfg.PlateEnabled then
-		cache.billboard.Enabled = onVis
-		if cache.nameLbl and cfg.ShowName then
-			cache.nameLbl.Text = player.DisplayName ~= "" and player.DisplayName or player.Name
-			cache.nameLbl.TextTransparency = 1 - alpha
-		end
-		if cache.distLbl and cfg.ShowDistance then
-			cache.distLbl.Text = string.format("⟦ %.1f studs ⟧", d)
-			cache.distLbl.TextTransparency = 1 - alpha
-		end
-		if cache.base then
-			local s = cache.base:FindFirstChildOfClass("UIStroke")
-			if s then s.Color = (cfg.Style == "Mono") and color or Color3.new(1,1,1); s.Transparency = 0.2 + (1-alpha)*0.6 end
-			local g = cache.base:FindFirstChildOfClass("UIGradient")
-			if g then g.Enabled = (cfg.Style == "Nebula") end
-			local glow = cache.base:FindFirstChild("Glow")
-			if glow and glow:IsA("UIStroke") then
-				glow.Enabled = cfg.Glow
-				glow.Transparency = cfg.GlowTransparency + (1-alpha)*0.2
-				glow.Color = (cfg.Style == "Mono") and color or Color3.fromRGB(200,120,255)
+	-- Plate (texts + hp bar)
+	if cfg.Plate then
+		local head = model:FindFirstChild("Head")
+		local anchor = head or root
+		if anchor then
+			local p2d, on = toScreen(anchor.Position + Vector3.new(0, cfg.PlateYOffset, 0))
+			if on and vis then
+				if cfg.ShowName then
+					cache.nameText.Text = player.DisplayName ~= "" and player.DisplayName or player.Name
+					cache.nameText.Size = cfg.TextSize
+					cache.nameText.Position = p2d + Vector2.new(0, -14)
+					cache.nameText.Color = cfg.NameColor
+					cache.nameText.Outline = true
+					cache.nameText.OutlineColor = outlineCol
+					cache.nameText.Transparency = alpha
+					cache.nameText.Visible = true
+				else cache.nameText.Visible = false end
+
+				if cfg.ShowDistance then
+					cache.distText.Text = string.format("[%.1f]", d)
+					cache.distText.Size = math.floor(cfg.TextSize * 0.9)
+					cache.distText.Position = p2d + Vector2.new(0, 2)
+					cache.distText.Color = cfg.InfoColor
+					cache.distText.Outline = true
+					cache.distText.OutlineColor = outlineCol
+					cache.distText.Transparency = alpha
+					cache.distText.Visible = true
+				else cache.distText.Visible = false end
+
+				if cfg.HPBar then
+					local w, h = 72, 5
+					local backPos = p2d + Vector2.new(-w/2, 18)
+					cache.hpBack.Position = backPos
+					cache.hpBack.Size = Vector2.new(w, h)
+					cache.hpBack.Filled = true
+					cache.hpBack.Color = Color3.fromRGB(35, 40, 55)
+					cache.hpBack.Transparency = alpha * 0.9
+					cache.hpBack.Visible = true
+
+					local hp = math.max(0, hum.Health) / math.max(1, hum.MaxHealth)
+					cache.hpFill.Position = backPos
+					cache.hpFill.Size = Vector2.new(w * hp, h)
+					cache.hpFill.Filled = true
+					cache.hpFill.Color = colorLerp(Color3.fromRGB(255,90,90), Color3.fromRGB(110,255,180), hp)
+					cache.hpFill.Transparency = alpha
+					cache.hpFill.Visible = true
+
+					cache.hpOutline.Position = backPos
+					cache.hpOutline.Size = Vector2.new(w, h)
+					cache.hpOutline.Color = outlineCol
+					cache.hpOutline.Thickness = 1 + cfg.OutlineWidth * 0.5
+					cache.hpOutline.Transparency = outlineA
+					cache.hpOutline.Visible = true
+				else
+					cache.hpBack.Visible = false; cache.hpFill.Visible = false; cache.hpOutline.Visible = false
+				end
+			else
+				cache.nameText.Visible = false; cache.distText.Visible = false
+				cache.hpBack.Visible = false; cache.hpFill.Visible = false; cache.hpOutline.Visible = false
 			end
 		end
-		if cache.hbFill and cfg.ShowHealthbar then
-			local hp = math.max(0, hum.Health) / math.max(1, hum.MaxHealth)
-			cache.hbFill.Size = UDim2.fromScale(hp, 1)
-			cache.hbFill.BackgroundTransparency = 1 - alpha
-		end
-	else
-		if cache.billboard then cache.billboard.Enabled = false end
 	end
 
-	--================ Box ==================
-	if cfg.BoxEnabled then
+	-- Box (brackets with crisp outline)
+	if cfg.Box then
 		local minV, maxV, onScr = getBox2D(model)
-		if onScr and onVis then
-			local w = maxV.X - minV.X
-			local h = maxV.Y - minV.Y
-			local seg = math.clamp(math.min(w,h) * cfg.CornerLenRatio, 10, 26)
-			local th = math.max(cfg.CornerThickness, lineThickness)
-
-			local cx = {minV.X, maxV.X}
-			local cy = {minV.Y, maxV.Y}
-			local c = cache.corners
-
-			-- top-left (horiz, vert)
-			setLine(c[1], Vector2.new(cx[1], cy[1]), Vector2.new(cx[1]+seg, cy[1]), th, faint, cfg.Glow)
-			setLine(c[2], Vector2.new(cx[1], cy[1]), Vector2.new(cx[1], cy[1]+seg), th, faint, cfg.Glow)
-			-- top-right
-			setLine(c[3], Vector2.new(cx[2]-seg, cy[1]), Vector2.new(cx[2], cy[1]), th, faint, cfg.Glow)
-			setLine(c[4], Vector2.new(cx[2], cy[1]), Vector2.new(cx[2], cy[1]+seg), th, faint, cfg.Glow)
-			-- bottom-left
-			setLine(c[5], Vector2.new(cx[1], cy[2]-seg), Vector2.new(cx[1], cy[2]), th, faint, cfg.Glow)
-			setLine(c[6], Vector2.new(cx[1], cy[2]), Vector2.new(cx[1]+seg, cy[2]), th, faint, cfg.Glow)
-			-- bottom-right
-			setLine(c[7], Vector2.new(cx[2]-seg, cy[2]), Vector2.new(cx[2], cy[2]), th, faint, cfg.Glow)
-			setLine(c[8], Vector2.new(cx[2], cy[2]-seg), Vector2.new(cx[2], cy[2]), th, faint, cfg.Glow)
-
-			for _,f in ipairs(c) do f.BackgroundTransparency = 1 - alpha end
-		else
-			for _,f in ipairs(cache.corners) do f.Visible = false end
-		end
-	else
-		for _,f in ipairs(cache.corners) do f.Visible = false end
-	end
-
-	--================ Tracer ================
-	if cfg.Tracers then
-		local p2d, onScr = toScreen(root.Position)
-		local originY = (cfg.TracerFrom == "top" and 0.12) or (cfg.TracerFrom == "center" and 0.5) or 0.9
-		local origin = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y*originY)
-
-		if onScr and onVis then
-			setLine(cache.tracer, origin, p2d, math.max(1, lineThickness-0), faint, cfg.Glow)
-			if cfg.TracerDot then
-				setDot(cache.tracerDot, p2d, 6 + lineThickness, color, cfg.Glow, alpha)
+		if onScr and vis then
+			local w = maxV.X - minV.X; local h = maxV.Y - minV.Y
+			local seg = math.clamp(math.min(w,h) * cfg.CornerLenRatio, 10, 28)
+			local cx = {minV.X, maxV.X}; local cy = {minV.Y, maxV.Y}
+			local i = 0
+			local function L(ax, ay, bx, by)
+				i += 1
+				-- outline under
+				drawLine(cache.boxOutline[i], Vector2.new(ax,ay), Vector2.new(bx,by), thick + cfg.OutlineWidth, outlineCol, outlineA)
+				-- main
+				drawLine(cache.box[i], Vector2.new(ax,ay), Vector2.new(bx,by), thick, accent, alpha)
 			end
-			cache.tracer.Transparency = 1 - alpha
+			-- TL
+			L(cx[1], cy[1], cx[1]+seg, cy[1]); L(cx[1], cy[1], cx[1], cy[1]+seg)
+			-- TR
+			L(cx[2]-seg, cy[1], cx[2], cy[1]); L(cx[2], cy[1], cx[2], cy[1]+seg)
+			-- BL
+			L(cx[1], cy[2]-seg, cx[1], cy[2]); L(cx[1], cy[2], cx[1]+seg, cy[2])
+			-- BR
+			L(cx[2]-seg, cy[2], cx[2], cy[2]); L(cx[2], cy[2]-seg, cx[2], cy[2])
+			for j=i+1,8 do cache.box[j].Visible=false; cache.boxOutline[j].Visible=false end
 		else
-			cache.tracer.Visible = false
-			cache.tracerDot.Visible = false
+			for j=1,8 do cache.box[j].Visible=false; cache.boxOutline[j].Visible=false end
 		end
 	else
-		cache.tracer.Visible = false
-		cache.tracerDot.Visible = false
+		for j=1,8 do cache.box[j].Visible=false; cache.boxOutline[j].Visible=false end
 	end
 
-	--================ Skeleton ==============
+	-- Tracer with dot (and crisp outline)
+	if cfg.Tracer then
+		local p2d, onScr = toScreen(root.Position)
+		local oy = (cfg.TracerFrom=="top" and 0.12) or (cfg.TracerFrom=="center" and 0.5) or 0.9
+		local origin = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y*oy)
+		if onScr and vis then
+			-- outline first (under)
+			drawLine(cache.tracerOutline, origin, p2d, thick + cfg.OutlineWidth, outlineCol, outlineA)
+			-- main line
+			drawLine(cache.tracer, origin, p2d, thick, accent, alpha)
+
+			if cfg.TracerDot then
+				local r = 3 + thick
+				cache.dot.Position = p2d
+				cache.dot.Radius = r
+				cache.dot.Color = accent
+				cache.dot.Transparency = alpha
+				cache.dot.Visible = true
+
+				cache.dotRing.Position = p2d
+				cache.dotRing.Radius = r + math.max(1, cfg.OutlineWidth*0.5)
+				cache.dotRing.Color = outlineCol
+				cache.dotRing.Thickness = 1 + cfg.OutlineWidth
+				cache.dotRing.Transparency = outlineA
+				cache.dotRing.Visible = true
+			else
+				cache.dot.Visible = false; cache.dotRing.Visible = false
+			end
+		else
+			cache.tracer.Visible = false; cache.tracerOutline.Visible = false
+			cache.dot.Visible = false; cache.dotRing.Visible = false
+		end
+	else
+		cache.tracer.Visible = false; cache.tracerOutline.Visible = false
+		cache.dot.Visible = false; cache.dotRing.Visible = false
+	end
+
+	-- Skeleton (with outline)
 	if cfg.Skeleton and d <= cfg.SkeletonMaxDist then
-		local map = (cache.rigType == Enum.HumanoidRigType.R15) and skeletonR15 or skeletonR6
-		local idx = 1
+		local map = (cache.rigType == Enum.HumanoidRigType.R15) and SkelR15 or SkelR6
+		local idx = 0
 		for _, pair in ipairs(map) do
 			local a = model:FindFirstChild(pair[1])
 			local b = model:FindFirstChild(pair[2])
 			if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
 				local a2d, aOn = toScreen(a.Position)
 				local b2d, bOn = toScreen(b.Position)
-				if aOn and bOn and onVis then
-					local l = cache.skeletonLines[idx]
-					if not l then l = newLine(Overlay, 23); cache.skeletonLines[idx] = l end
-					setLine(l, a2d, b2d, math.max(1, lineThickness-0), color, cfg.Glow)
-					l.Transparency = 1 - alpha
+				if aOn and bOn and vis then
 					idx += 1
+					-- outline
+					drawLine(cache.skelOutline[idx], a2d, b2d, thick + cfg.OutlineWidth, outlineCol, outlineA)
+					-- main
+					drawLine(cache.skel[idx], a2d, b2d, thick, accent, alpha)
 				end
 			end
 		end
-		for j = idx, #cache.skeletonLines do
-			local L = cache.skeletonLines[j]; if L then L.Visible = false end
-		end
+		for j=idx+1, #cache.skel do cache.skel[j].Visible=false; cache.skelOutline[j].Visible=false end
 	else
-		for _,l in ipairs(cache.skeletonLines) do l.Visible = false end
+		for j=1, #cache.skel do cache.skel[j].Visible=false; cache.skelOutline[j].Visible=false end
 	end
 
-	--================ Arrows =================
+	-- Offscreen arrows (outlined)
 	if cfg.Arrows then
 		local p2d, onScr, z = toScreen(root.Position)
-		local arr = cache.arrow
-		if not onScr and z > 0 and onVis then
+		if not onScr and z > 0 and vis then
 			local vp = Camera.ViewportSize
 			local center = Vector2.new(vp.X/2, vp.Y/2)
 			local dir = (p2d - center)
 			local ang = math.atan2(dir.Y, dir.X)
 			local radius = math.min(center.X, center.Y) - cfg.ArrowRadius
 			local pos = center + Vector2.new(math.cos(ang), math.sin(ang)) * radius
-			placeChevron(arr, pos, cfg.ArrowSize, math.deg(ang), faint, cfg.Glow)
+			local L, T, R = offscreenTriangle(pos, ang, cfg.ArrowSize)
+
+			-- outlines
+			drawLine(cache.arrOutline[1], T, L, thick + cfg.OutlineWidth, outlineCol, outlineA)
+			drawLine(cache.arrOutline[2], T, R, thick + cfg.OutlineWidth, outlineCol, outlineA)
+			drawLine(cache.arrOutline[3], L, R, math.max(1, thick-1) + cfg.OutlineWidth, outlineCol, outlineA)
+
+			-- mains
+			drawLine(cache.arr[1], T, L, thick, accent, alpha)
+			drawLine(cache.arr[2], T, R, thick, accent, alpha)
+			drawLine(cache.arr[3], L, R, math.max(1, thick-1), accent, alpha*0.9)
 		else
-			arr.Visible = false
+			for i=1,3 do cache.arr[i].Visible=false; cache.arrOutline[i].Visible=false end
 		end
 	else
-		cache.arrow.Visible = false
+		for i=1,3 do cache.arr[i].Visible=false; cache.arrOutline[i].Visible=false end
 	end
 end
 
 function ESP:Init(custom)
+	if not hasDrawing() then
+		warn("[ESP_Drawing_Outlines] Drawing API not found; nothing will render.")
+	end
 	if custom then
 		for k,v in pairs(custom) do
 			if self.Config[k] ~= nil then self.Config[k] = v end
 		end
 	end
 
-	-- cleanup old
+	-- cleanup
 	for _,cache in pairs(self._caches) do destroyCache(cache) end
 	self._caches = {}
 
-	-- attach to existing players
-	for _, p in ipairs(Players:GetPlayers()) do
+	-- FOV
+	if self.Config.ShowFOV then
+		if not self._fov then self._fov = newCircle() end
+		self._fov.Radius = self.Config.FOVRadius
+		self._fov.Color = self.Config.OutlineColor
+		self._fov.Transparency = 0.6
+		self._fov.Filled = false
+		self._fov.Thickness = 1 + self.Config.OutlineWidth
+		self._fov.Visible = true
+	else
+		if self._fov then self._fov.Visible = false end
+	end
+
+	-- attach existing
+	for _,p in ipairs(Players:GetPlayers()) do
 		if p ~= LocalPlayer then
 			local char = p.Character or p.CharacterAdded:Wait()
 			self._caches[p] = makeCache(self, p, char)
@@ -670,13 +568,11 @@ function ESP:Init(custom)
 	table.insert(self._cons, Players.PlayerAdded:Connect(function(p)
 		if p == LocalPlayer then return end
 		p.CharacterAdded:Connect(function(char)
-			-- if existing cache, replace
 			local old = self._caches[p]
 			if old then destroyCache(old) end
 			self._caches[p] = makeCache(self, p, char)
 		end)
 	end))
-
 	table.insert(self._cons, Players.PlayerRemoving:Connect(function(p)
 		local c = self._caches[p]
 		if c then destroyCache(c) end
@@ -689,22 +585,20 @@ end
 function ESP:Start()
 	if self._running then return end
 	self._running = true
-	table.insert(self._cons, RunService.RenderStepped:Connect(function(dt)
+	table.insert(self._cons, RunService.RenderStepped:Connect(function()
+		-- FOV update
+		if self._fov and self.Config.ShowFOV then
+			local m = UIS:GetMouseLocation()
+			self._fov.Position = m
+			self._fov.Visible = true
+		end
+
 		if not self.Config.Enabled then
-			for _,cache in pairs(self._caches) do
-				if cache.billboard then cache.billboard.Enabled = false end
-				for _,f in ipairs(cache.corners) do f.Visible = false end
-				for _,l in ipairs(cache.skeletonLines) do l.Visible = false end
-				if cache.tracer then cache.tracer.Visible = false end
-				if cache.tracerDot then cache.tracerDot.Visible = false end
-				if cache.arrow then cache.arrow.Visible = false end
-			end
+			for _,cache in pairs(self._caches) do hideCache(cache) end
 			return
 		end
 
-		if not Overlay.Parent then Overlay.Parent = getGuiRoot() end
-
-		for _, player in ipairs(Players:GetPlayers()) do
+		for _,player in ipairs(Players:GetPlayers()) do
 			if player ~= LocalPlayer then
 				local char = player.Character
 				if char then
@@ -714,7 +608,7 @@ function ESP:Start()
 						cache = makeCache(self, player, char)
 						self._caches[player] = cache
 					end
-					updateOne(self, player, cache, dt)
+					updateOne(self, player, cache)
 				end
 			end
 		end
@@ -725,21 +619,16 @@ function ESP:Stop()
 	self._running = false
 	for _,c in ipairs(self._cons) do c:Disconnect() end
 	self._cons = {}
-	for _,cache in pairs(self._caches) do
-		if cache.billboard then cache.billboard.Enabled = false end
-		for _,f in ipairs(cache.corners) do f.Visible = false end
-		for _,l in ipairs(cache.skeletonLines) do l.Visible = false end
-		if cache.tracer then cache.tracer.Visible = false end
-		if cache.tracerDot then cache.tracerDot.Visible = false end
-		if cache.arrow then cache.arrow.Visible = false end
-	end
+	for _,cache in pairs(self._caches) do hideCache(cache) end
+	if self._fov then self._fov.Visible = false end
 end
 
 function ESP:Destroy()
 	self:Stop()
 	for _,cache in pairs(self._caches) do destroyCache(cache) end
 	self._caches = {}
-	if Overlay then Overlay:Destroy() end
+	if self._fov then pcall(function() self._fov:Remove() end) end
+	self._fov = nil
 end
 
 return ESP.new()
