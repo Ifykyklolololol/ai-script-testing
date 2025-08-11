@@ -403,7 +403,7 @@ end
 -- Create/update caches
 ESP.Config = table.clone(defaultConfig)
 ESP._connections = {}
-ESP._caches = {} :: {[Model]: CharacterCache}
+ESP._caches = {} :: {[Player]: CharacterCache}
 ESP._running = false
 
 -- Utility for raycast visibility
@@ -472,10 +472,7 @@ local skeletonMapR6 = {
 	{"Right Leg","Right Leg"},
 }
 
-local function ensureCache(self, model: Model): CharacterCache
-	local cache = self._caches[model]
-	if cache then return cache end
-
+local function ensureCache(self, player: Player, model: Model): CharacterCache
 	local hum = model:FindFirstChildOfClass("Humanoid")
 	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 
@@ -770,7 +767,7 @@ local function updateCharacter(self, player: Player, cache: CharacterCache, dt: 
 	end
 end
 
-function ESP:Init(custom: Partial<ESPConfig>?)
+function ESP:Init(custom)
 	if custom then
 		for k, v in pairs(custom :: any) do
 			if self.Config[k] ~= nil then
@@ -795,27 +792,26 @@ function ESP:Init(custom: Partial<ESPConfig>?)
 	for _, p in ipairs(Players:GetPlayers()) do
 		if p ~= LocalPlayer then
 			local char = p.Character or p.CharacterAdded:Wait()
-			self._caches[char] = ensureCache(self, char)
+			self._caches[p] = ensureCache(self, p, char)
 		end
 	end
 
 	table.insert(self._connections, Players.PlayerAdded:Connect(function(p)
 		if p == LocalPlayer then return end
 		p.CharacterAdded:Connect(function(char)
-			self._caches[char] = ensureCache(self, char)
+			self._caches[p] = ensureCache(self, p, char)
 		end)
 	end))
 
 	table.insert(self._connections, Players.PlayerRemoving:Connect(function(p)
-		local char = p.Character
-		if char and self._caches[char] then
-			local cache = self._caches[char]
+	if self._caches[p] then
+		local cache = self._caches[p]
 			if cache.billboard then cache.billboard:Destroy() end
 			if cache.boxFrame then cache.boxFrame:Destroy() end
 			if cache.tracer then cache.tracer:Destroy() end
 			if cache.arrow then cache.arrow:Destroy() end
 			for _,l in ipairs(cache.skeletonLines) do l:Destroy() end
-			self._caches[char] = nil
+			self._caches[p] = nil
 		end
 	end))
 
