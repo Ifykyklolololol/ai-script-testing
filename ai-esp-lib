@@ -1,18 +1,24 @@
--- box_chroma_esp.lua
--- Chroma (rainbow) Box ESP with animated gradient that travels around each box.
--- Built for executors that support the Drawing API.
--- Drop this in your executor or loadstring(readfile("box_chroma_esp.lua"))()
+-- box_bw_outline_esp.lua
+-- Black & White (grayscale) animated Box ESP with optional outline.
+-- Gradient "travels" around each box; main line is grayscale only.
+-- Requires an executor that supports the Drawing API.
 
 --== CONFIG ==--
-getgenv().ChromaBoxESP = {
+getgenv().BWBoxESP = {
     Enabled = true,
-    TeamCheck = false,          -- don't draw on teammates
-    MaxDistance = 5000,         -- studs
-    Thickness = 2,              -- line thickness
-    SegmentsPerEdge = 24,       -- higher = smoother gradient (total segments = 4x this)
-    HueSpeed = 0.15,            -- how fast the colors move around the box
-    Transparency = 1,           -- 0..1
-    OnlyAlive = true,           -- only draw when humanoid > 0
+    TeamCheck = false,            -- don't draw on teammates
+    MaxDistance = 5000,           -- studs
+    Thickness = 2,                -- main line thickness
+    SegmentsPerEdge = 24,         -- higher = smoother gradient (total segments = 4x)
+    Speed = 0.18,                 -- how fast the grayscale travels around the box
+    Transparency = 1,             -- 0..1 for main line
+
+    -- Outline settings
+    Outline = true,               -- draw an outline behind the main line
+    OutlineThickness = 2,         -- added on top of main Thickness
+    OutlineTransparency = 1,      -- 0..1
+    OutlineColor = Color3.new(0, 0, 0), -- default black outline
+    OnlyAlive = true,             -- only draw when humanoid health > 0
 }
 
 --== IMPLEMENTATION ==--
@@ -23,67 +29,50 @@ local Workspace = game:GetService("Workspace")
 local Camera = Workspace.CurrentCamera
 
 local LocalPlayer = Players.LocalPlayer
+local cfg = getgenv().BWBoxESP
 
-local cfg = getgenv().ChromaBoxESP
-local aliveHumanoidStates = {
-    [Enum.HumanoidStateType.Dead] = false,
-    [Enum.HumanoidStateType.None] = true, -- default to true unless explicitly Dead
-}
-
-local function isAlive(hum)
-    if not hum then return false end
-    if hum.Health <= 0 then return false end
-    return true
-end
-
--- Utility: safely check Drawing API
-local function newLine()
-    local line = Drawing.new("Line")
-    line.Visible = false
-    line.Thickness = cfg.Thickness
-    line.Transparency = cfg.Transparency
-    return line
-end
-
+-- Safety: Drawing API check
 if not Drawing or not Drawing.new then
-    warn("[ChromaBoxESP] Drawing API not found. This script requires an executor with Drawing support.")
+    warn("[BWBoxESP] Drawing API not found. This script requires an executor with Drawing support.")
     return
 end
 
--- Store ESP state per player
-local ESP = {}
--- Each entry:
--- ESP[player] = {
---   lines = { [1..TotalSegments] = DrawingLine },
---   totalSegments = number
--- }
-
-local function clearPlayerEsp(plr)
-    local entry = ESP[plr]
-    if not entry then return end
-    if entry.lines then
-        for _, ln in ipairs(entry.lines) do
-            pcall(function() ln.Visible = false ln:Remove() end)
-        end
-    end
-    ESP[plr] = nil
+-- Utils
+local function isAlive(hum)
+    if not hum then return false end
+    return hum.Health > 0
 end
 
-local function ensurePlayerEsp(plr)
-    local entry = ESP[plr]
-    local needed = math.max(4 * math.max(2, cfg.SegmentsPerEdge), 8)
-    if entry and entry.totalSegments == needed then
-        return entry
-    end
-    -- rebuild
-    if entry then clearPlayerEsp(plr) end
-    local lines = table.create(needed)
-    for i = 1, needed do
-        lines[i] = newLine()
-    end
-    entry = { lines = lines, totalSegments = needed }
-    ESP[plr] = entry
-    return entry
+local function isSameTeam(a, b)
+    if not a or not b then return false end
+    local ok, same = pcall(function()
+        return a.Team ~= nil and b.Team ~= nil and a.Team == b.Team
+    end)
+    return ok and same or false
+end
+
+local function newLine(thickness, transparency)
+    local line = Drawing.new("Line")
+    line.Visible = false
+    line.Thickness = thickness
+    line.Transparency = transparency
+    -- many Drawing APIs support ZIndex; set in case it's available
+    pcall(function()
+        line.ZIndex = 2
+    end)
+    return line
+end
+
+local function newOutlineLine(outThickness, outTransparency, outColor)
+    local line = Drawing.new("Line")
+    line.Visible = false
+    line.Thickness = outThickness
+    line.Transparency = outTransparency
+    line.Color = outColor
+    pcall(function()
+        line.ZIndex = 1
+    end)
+    return line
 end
 
 -- Compute a 2D screen-space bounding rectangle for a character model
@@ -131,7 +120,7 @@ local function getScreenRect(model)
     return minX, minY, width, height
 end
 
--- Split an edge into N segments, returning pair endpoints for each segment
+-- Subdivide edges into segments for smooth animated gradient
 local function subdivideEdge(x1, y1, x2, y2, n)
     local segments = table.create(n)
     for i = 0, n - 1 do
@@ -146,7 +135,6 @@ local function subdivideEdge(x1, y1, x2, y2, n)
     return segments
 end
 
--- Build segment endpoints for the rectangle perimeter (clockwise), top->right->bottom->left
 local function rectSegments(x, y, w, h, perEdge)
     local segs = {}
 
@@ -163,33 +151,66 @@ local function rectSegments(x, y, w, h, perEdge)
     return segs
 end
 
--- Determine if two players are on the same team (safe fallback if teams not present)
-local function isSameTeam(a, b)
-    if not a or not b then return false end
-    pcall(function()
-        if a.Team ~= nil and b.Team ~= nil and a.Team == b.Team then
-            return true
+-- State
+local ESP = {}
+-- ESP[player] = {
+--   pairs = { [1..N] = {outline = DrawingLine?, main = DrawingLine} },
+--   totalSegments = number
+-- }
+
+local function clearPlayerEsp(plr)
+    local entry = ESP[plr]
+    if not entry then return end
+    if entry.pairs then
+        for _, p in ipairs(entry.pairs) do
+            if p.main then pcall(function() p.main.Visible = false p.main:Remove() end) end
+            if p.outline then pcall(function() p.outline.Visible = false p.outline:Remove() end) end
         end
-    end)
-    return false
+    end
+    ESP[plr] = nil
+end
+
+local function ensurePlayerEsp(plr, neededSegments)
+    local entry = ESP[plr]
+    if entry and entry.totalSegments == neededSegments then
+        return entry
+    end
+    if entry then clearPlayerEsp(plr) end
+
+    local pairsArr = table.create(neededSegments)
+    for i = 1, neededSegments do
+        local outlineObj = nil
+        if cfg.Outline then
+            outlineObj = newOutlineLine(cfg.Thickness + cfg.OutlineThickness, cfg.OutlineTransparency, cfg.OutlineColor)
+        end
+        local mainObj = newLine(cfg.Thickness, cfg.Transparency)
+        pairsArr[i] = { outline = outlineObj, main = mainObj }
+    end
+
+    entry = { pairs = pairsArr, totalSegments = neededSegments }
+    ESP[plr] = entry
+    return entry
 end
 
 -- Main update loop
 local lastCleanup = 0
 RunService.RenderStepped:Connect(function(dt)
     if not cfg.Enabled then
-        -- hide all
-        for plr, entry in pairs(ESP) do
-            for _, ln in ipairs(entry.lines) do ln.Visible = false end
+        for _, entry in pairs(ESP) do
+            for _, p in ipairs(entry.pairs) do
+                if p.main then p.main.Visible = false end
+                if p.outline then p.outline.Visible = false end
+            end
         end
         return
     end
 
     local myChar = LocalPlayer.Character
     local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-
-    local hueOffset = (tick() * cfg.HueSpeed) % 1
     local perEdge = math.max(2, cfg.SegmentsPerEdge)
+
+    -- animated phase for grayscale wave
+    local phaseOffset = (tick() * cfg.Speed) % 1
 
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
@@ -198,7 +219,6 @@ RunService.RenderStepped:Connect(function(dt)
             local hum = char and char:FindFirstChildOfClass("Humanoid")
 
             local shouldDraw = char ~= nil and root ~= nil
-
             if shouldDraw and cfg.TeamCheck and isSameTeam(plr, LocalPlayer) then
                 shouldDraw = false
             end
@@ -209,58 +229,62 @@ RunService.RenderStepped:Connect(function(dt)
                 shouldDraw = false
             end
 
-            local entry = ensurePlayerEsp(plr)
-            local lines, total = entry.lines, entry.totalSegments
+            local x, y, w, h = nil, nil, nil, nil
+            if shouldDraw then
+                x, y, w, h = getScreenRect(char)
+                if not x then
+                    shouldDraw = false
+                end
+            end
+
+            local totalSegs = 4 * perEdge
+            local entry = ensurePlayerEsp(plr, totalSegs)
+            local pairsArr = entry.pairs
 
             if shouldDraw then
-                local x, y, w, h = getScreenRect(char)
-                if x and y and w and h then
-                    -- Build or reuse segment endpoints
-                    local segs = rectSegments(x, y, w, h, perEdge)
-                    local totalSegs = #segs
+                local segs = rectSegments(x, y, w, h, perEdge)
 
-                    -- If config changed since ensure, rebuild lines count if necessary
-                    if totalSegs ~= total then
-                        clearPlayerEsp(plr)
-                        entry = ensurePlayerEsp(plr)
-                        lines = entry.lines
-                        total = entry.totalSegments
+                for i = 1, totalSegs do
+                    local s = segs[i]
+                    local pair = pairsArr[i]
+
+                    -- grayscale value 0..1 that travels around the perimeter
+                    local t = (i - 1) / totalSegs
+                    local wave = math.sin(2 * math.pi * ((t + phaseOffset) % 1))
+                    local v = 0.5 + 0.5 * wave -- 0..1
+                    local gray = Color3.fromHSV(0, 0, v)
+
+                    if pair.outline then
+                        pair.outline.Thickness = cfg.Thickness + cfg.OutlineThickness
+                        pair.outline.Transparency = cfg.OutlineTransparency
+                        pair.outline.Color = cfg.OutlineColor
+                        pair.outline.From = Vector2.new(s[1], s[2])
+                        pair.outline.To   = Vector2.new(s[3], s[4])
+                        pair.outline.Visible = true
                     end
 
-                    -- Draw each small segment with a different hue so it "travels" around
-                    for i = 1, totalSegs do
-                        local s = segs[i]
-                        local ln = lines[i]
-                        local t = (i - 1) / totalSegs
-                        local hue = (t + hueOffset) % 1
-                        ln.Color = Color3.fromHSV(hue, 1, 1)
-                        ln.Thickness = cfg.Thickness
-                        ln.Transparency = cfg.Transparency
-                        ln.From = Vector2.new(s[0 + 1], s[1 + 1])
-                        ln.To   = Vector2.new(s[2 + 1], s[3 + 1])
-                        ln.Visible = true
-                    end
-
-                    -- Hide any extra lines (shouldn't happen unless counts changed)
-                    for j = totalSegs + 1, #lines do
-                        lines[j].Visible = false
-                    end
-                else
-                    -- off-screen
-                    for _, ln in ipairs(lines) do ln.Visible = false end
+                    pair.main.Color = gray
+                    pair.main.Thickness = cfg.Thickness
+                    pair.main.Transparency = cfg.Transparency
+                    pair.main.From = Vector2.new(s[1], s[2])
+                    pair.main.To   = Vector2.new(s[3], s[4])
+                    pair.main.Visible = true
                 end
             else
-                -- not drawable
-                for _, ln in ipairs(lines) do ln.Visible = false end
+                for i = 1, totalSegs do
+                    local pair = pairsArr[i]
+                    if pair.main then pair.main.Visible = false end
+                    if pair.outline then pair.outline.Visible = false end
+                end
             end
         end
     end
 
-    -- Clean up for players that left (periodic to avoid heavy work every frame)
+    -- periodic cleanup
     lastCleanup += dt
     if lastCleanup > 1.5 then
         lastCleanup = 0
-        for plr, entry in pairs(ESP) do
+        for plr, _ in pairs(ESP) do
             if table.find(Players:GetPlayers(), plr) == nil then
                 clearPlayerEsp(plr)
             end
@@ -268,21 +292,21 @@ RunService.RenderStepped:Connect(function(dt)
     end
 end)
 
--- Clean up on script disable or re-execution
-local function onDisable()
-    for plr, _ in pairs(ESP) do
-        clearPlayerEsp(plr)
-    end
-end
-
--- optional public API
-getgenv().ChromaBoxESP_SetEnabled = function(v)
+-- Public toggle
+getgenv().BWBoxESP_SetEnabled = function(v)
     cfg.Enabled = not not v
     if not cfg.Enabled then
-        onDisable()
+        -- quick hide without destroying
+        for _, entry in pairs(ESP) do
+            for _, p in ipairs(entry.pairs) do
+                if p.main then p.main.Visible = false end
+                if p.outline then p.outline.Visible = false end
+            end
+        end
     end
 end
 
-print("[ChromaBoxESP] Loaded. Use getgenv().ChromaBoxESP to tweak settings. Example:")
-print("getgenv().ChromaBoxESP.SegmentsPerEdge = 32")
-print("getgenv().ChromaBoxESP.HueSpeed = 0.25")
+print("[BWBoxESP] Loaded. Use getgenv().BWBoxESP to tweak settings.")
+print("Examples:")
+print("getgenv().BWBoxESP.Speed = 0.3")
+print("getgenv().BWBoxESP.OutlineColor = Color3.new(1,1,1) -- white outline")
