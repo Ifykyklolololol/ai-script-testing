@@ -844,7 +844,7 @@ function ESP:Start()
 			ScreenGui.Parent = getGuiRoot()
 		end
 
-		for player in Players:GetPlayers() do
+		for _, player in ipairs(Players:GetPlayers()) do
 			if player ~= LocalPlayer then
 				local char = player.Character
 				if char then
