@@ -306,7 +306,4 @@ getgenv().BWBoxESP_SetEnabled = function(v)
     end
 end
 
-print("[BWBoxESP] Loaded. Use getgenv().BWBoxESP to tweak settings.")
-print("Examples:")
-print("getgenv().BWBoxESP.Speed = 0.3")
-print("getgenv().BWBoxESP.OutlineColor = Color3.new(1,1,1) -- white outline")
+print("YTO")
